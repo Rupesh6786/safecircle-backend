@@ -21,15 +21,28 @@ initializeApp({
     credential: cert(serviceAccount)
 });
 
-// Helper function to send FCM push notification
-async function sendPushNotification(token, title, body) {
+// Helper function to send FCM push notification with custom icon support
+async function sendPushNotification(token, title, body, icon = 'ic_notification', color = '#FF5722') {
     if (!token) return;
+
     try {
-        await getMessaging().send({
+        const message = {
             token: token,
-            notification: { title, body },
-            android: { priority: 'high' }
-        });
+            notification: {
+                title: title,
+                body: body,
+            },
+            android: {
+                priority: 'high',
+                notification: {
+                    icon: icon,   // Drawable resource name in Android (without .png extension)
+                    color: color  // Hex accent color for the notification background/badge
+                }
+            }
+        };
+
+        await getMessaging().send(message);
+        console.log(`✅ Push notification sent to token: ${token.substring(0, 10)}...`);
     } catch (err) {
         console.error('❌ Error sending push notification:', err.message);
     }
