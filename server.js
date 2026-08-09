@@ -30,7 +30,6 @@ async function sendPushNotification(token, title, body) {
             notification: { title, body },
             android: { priority: 'high' }
         });
-        console.log('✅ Push notification sent successfully');
     } catch (err) {
         console.error('❌ Error sending push notification:', err.message);
     }
