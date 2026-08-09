@@ -22,7 +22,7 @@ initializeApp({
 });
 
 // Helper function to send FCM push notification with custom icon support
-async function sendPushNotification(token, title, body, icon = 'ic_notification', color = '#FF5722') {
+async function sendPushNotification(token, title, body, icon = 'ic_notification', color = '#1A60FF') {
     if (!token) return;
 
     try {
@@ -35,14 +35,16 @@ async function sendPushNotification(token, title, body, icon = 'ic_notification'
             android: {
                 priority: 'high',
                 notification: {
-                    icon: icon,   // Drawable resource name in Android (without .png extension)
-                    color: color  // Hex accent color for the notification background/badge
+                    icon: icon,             // Must match drawable filename in res/drawable (ic_notification)
+                    color: color,            // Accent color matching your app theme (#1A60FF)
+                    channelId: 'safecircle_alerts', // Required for Android 8.0+ to prevent default icon fallback
+                    defaultSound: true,
+                    defaultVibrateTimings: true
                 }
             }
         };
 
-        await getMessaging().send(message);
-        console.log(`✅ Push notification sent to token: ${token.substring(0, 10)}...`);
+        const response = await getMessaging().send(message);
     } catch (err) {
         console.error('❌ Error sending push notification:', err.message);
     }
