@@ -553,6 +553,149 @@ app.put('/api/user/state', authenticateToken, async (req, res) => {
     }
 });
 
+// --- UPDATED PLACES API ROUTES ---
+
+/**
+ * POST /api/places/add
+ * Protected Route: Adds/Updates a place for the user's active Circle
+ */
+app.post('/api/places/add', authenticateToken, async (req, res) => {
+    const { id, name, address, safeZoneRadiusMeters, iconResId, latitude, longitude, circleId: bodyCircleId } = req.body;
+    const userId = req.user.id;
+
+    if (!id || !name || latitude == null || longitude == null) {
+        return res.status(400).json({ 
+            success: false, 
+            message: "Missing required fields: id, name, latitude, or longitude" 
+        });
+    }
+
+    try {
+        let activeCircleId = bodyCircleId;
+
+        // If circleId is not passed in body, fetch user's active circle_id from DB
+        if (!activeCircleId) {
+            const [circleRows] = await db.query(
+                "SELECT circle_id FROM circle_members WHERE user_id = ? LIMIT 1",
+                [userId]
+            );
+
+            if (circleRows.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "You must join or create a Circle before adding places."
+                });
+            }
+            activeCircleId = circleRows[0].circle_id;
+        }
+
+        const query = `
+            INSERT INTO places (id, circle_id, created_by_user_id, name, address, safe_zone_radius_meters, icon_res_id, latitude, longitude)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                name = VALUES(name),
+                address = VALUES(address),
+                safe_zone_radius_meters = VALUES(safe_zone_radius_meters),
+                icon_res_id = VALUES(icon_res_id),
+                latitude = VALUES(latitude),
+                longitude = VALUES(longitude)
+        `;
+
+        await db.execute(query, [
+            id,
+            activeCircleId,
+            userId,
+            name,
+            address || 'Custom Address',
+            safeZoneRadiusMeters || 200,
+            iconResId || 0,
+            latitude,
+            longitude
+        ]);
+
+        // Optional Socket.IO Real-Time Broadcast to all members in this Circle
+        io.to(`circle_${activeCircleId}`).emit('place_added', {
+            id,
+            name,
+            address,
+            safeZoneRadiusMeters,
+            iconResId,
+            latitude,
+            longitude,
+            createdBy: userId
+        });
+
+        return res.status(201).json({
+            success: true,
+            message: "Place added to circle successfully",
+            placeId: id,
+            circleId: activeCircleId
+        });
+
+    } catch (error) {
+        console.error('Add Place Error:', error);
+        return res.status(500).json({ 
+            success: false, 
+            message: "Server error: " + error.message 
+        });
+    }
+});
+
+/**
+ * GET /api/places
+ * Protected Route: Fetches all places shared within the authenticated user's Circle
+ */
+app.get('/api/places', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        // 1. Get the Circle ID of the user
+        const [userCircle] = await db.query(
+            "SELECT circle_id FROM circle_members WHERE user_id = ? LIMIT 1",
+            [userId]
+        );
+
+        if (userCircle.length === 0) {
+            return res.status(200).json({
+                success: true,
+                places: []
+            });
+        }
+
+        const circleId = userCircle[0].circle_id;
+
+        // 2. Query all places associated with this circle
+        const [rows] = await db.query(
+            `SELECT 
+                p.id, 
+                p.name, 
+                p.address, 
+                p.safe_zone_radius_meters AS safeZoneRadiusMeters, 
+                p.icon_res_id AS iconResId, 
+                p.latitude, 
+                p.longitude,
+                p.created_by_user_id AS createdBy
+            FROM places p
+            WHERE p.circle_id = ? 
+            ORDER BY p.created_at DESC`,
+            [circleId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            circleId: circleId,
+            places: rows
+        });
+
+    } catch (error) {
+        console.error('Get Places Error:', error);
+        return res.status(500).json({ 
+            success: false, 
+            message: "Server error: " + error.message 
+        });
+    }
+});
+
 
 // --- Server Startup ---
 const PORT = process.env.PORT || 5100;
