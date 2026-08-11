@@ -308,23 +308,25 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
         // 2. Fetch all circle members with dynamic states and profile avatars
         if (user.circle_id) {
             const [memberRows] = await db.query(`
-                SELECT 
-                    u.id, 
-                    u.full_name, 
-                    u.email,
-                    u.profile_avatar,
-                    COALESCE(us.battery_level, 100) AS battery_level,
-                    COALESCE(us.speed, NULL) AS speed,
-                    CASE 
-                        WHEN us.updated_at IS NULL THEN 'Offline'
-                        WHEN TIMESTAMPDIFF(MINUTE, us.updated_at, NOW()) > 5 THEN 'Offline'
-                        ELSE COALESCE(us.status, 'Active')
-                    END AS current_status
-                FROM circle_members cm
-                JOIN users u ON cm.user_id = u.id
-                LEFT JOIN user_states us ON u.id = us.user_id
-                WHERE cm.circle_id = ?
-            `, [user.circle_id]);
+        SELECT 
+            u.id, 
+            u.full_name, 
+            u.email,
+            u.profile_avatar,
+            COALESCE(us.battery_level, 100) AS battery_level,
+            COALESCE(us.speed, NULL) AS speed,
+            us.latitude,
+            us.longitude,
+            CASE 
+                WHEN us.updated_at IS NULL THEN 'Offline'
+                WHEN TIMESTAMPDIFF(MINUTE, us.updated_at, NOW()) > 5 THEN 'Offline'
+                ELSE COALESCE(us.status, 'Active')
+            END AS current_status
+        FROM circle_members cm
+        JOIN users u ON cm.user_id = u.id
+        LEFT JOIN user_states us ON u.id = us.user_id
+        WHERE cm.circle_id = ?
+    `, [user.circle_id]);
 
             circleData = {
                 id: user.circle_id,
@@ -338,7 +340,9 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
                     profile_avatar: m.profile_avatar || null,
                     status: m.current_status,
                     batteryLevel: m.battery_level,
-                    speed: m.speed
+                    speed: m.speed,
+                    latitude: m.latitude,
+                    longitude: m.longitude
                 }))
             };
         }
@@ -528,28 +532,63 @@ app.post('/api/circle/join', async (req, res) => {
     }
 });
 
-// PUT /api/user/state - Update current user's battery and status
+// PUT /api/user/state - Update current user's battery, status, speed, and location
 app.put('/api/user/state', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { batteryLevel, status, speed } = req.body;
+        // 1. Extract lat and lng from request body alongside existing parameters
+        const { batteryLevel, status, speed, latitude, longitude, lat, lng } = req.body;
 
+        // Support both naming conventions (latitude/longitude OR lat/lng)
+        const finalLat = latitude !== undefined ? latitude : (lat !== undefined ? lat : null);
+        const finalLng = longitude !== undefined ? longitude : (lng !== undefined ? lng : null);
+
+        // 2. Insert or update user state including location coordinates
         const query = `
-            INSERT INTO user_states (user_id, battery_level, status, speed, updated_at)
-            VALUES (?, ?, ?, ?, NOW())
+            INSERT INTO user_states (user_id, battery_level, status, speed, latitude, longitude, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, NOW())
             ON DUPLICATE KEY UPDATE 
                 battery_level = VALUES(battery_level),
                 status = VALUES(status),
                 speed = VALUES(speed),
+                latitude = VALUES(latitude),
+                longitude = VALUES(longitude),
                 updated_at = NOW()
         `;
 
-        await db.query(query, [userId, batteryLevel || 100, status || 'Active', speed || null]);
+        await db.query(query, [
+            userId,
+            batteryLevel || 100,
+            status || 'Active',
+            speed || null,
+            finalLat,
+            finalLng
+        ]);
 
-        return res.status(200).json({ success: true, message: "State updated successfully" });
+        // 3. Broadcast real-time location & state update via Socket.IO if user belongs to a circle
+        const [circleRows] = await db.query(
+            "SELECT circle_id FROM circle_members WHERE user_id = ? LIMIT 1",
+            [userId]
+        );
+
+        if (circleRows.length > 0) {
+            const circleId = circleRows[0].circle_id;
+            io.to(`circle_${circleId}`).emit('member_location_updated', {
+                userId: userId,
+                latitude: finalLat,
+                longitude: finalLng,
+                batteryLevel: batteryLevel || 100,
+                status: status || 'Active',
+                speed: speed || null,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        return res.status(200).json({ success: true, message: "State and location updated successfully" });
+
     } catch (error) {
         console.error('Update State Error:', error);
-        return res.status(500).json({ success: false, message: 'Server error' });
+        return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
     }
 });
 
@@ -564,9 +603,9 @@ app.post('/api/places/add', authenticateToken, async (req, res) => {
     const userId = req.user.id;
 
     if (!id || !name || latitude == null || longitude == null) {
-        return res.status(400).json({ 
-            success: false, 
-            message: "Missing required fields: id, name, latitude, or longitude" 
+        return res.status(400).json({
+            success: false,
+            message: "Missing required fields: id, name, latitude, or longitude"
         });
     }
 
@@ -634,13 +673,12 @@ app.post('/api/places/add', authenticateToken, async (req, res) => {
 
     } catch (error) {
         console.error('Add Place Error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            message: "Server error: " + error.message 
+        return res.status(500).json({
+            success: false,
+            message: "Server error: " + error.message
         });
     }
 });
-
 /**
  * GET /api/places
  * Protected Route: Fetches all places shared within the authenticated user's Circle
@@ -689,9 +727,9 @@ app.get('/api/places', authenticateToken, async (req, res) => {
 
     } catch (error) {
         console.error('Get Places Error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            message: "Server error: " + error.message 
+        return res.status(500).json({
+            success: false,
+            message: "Server error: " + error.message
         });
     }
 });
