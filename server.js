@@ -150,6 +150,22 @@ io.on('connection', (socket) => {
     });
 });
 
+// Helper function to calculate distance between two coordinates in meters (Haversine Formula)
+function getDistanceInMeters(lat1, lon1, lat2, lon2) {
+    if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return Infinity;
+    
+    const R = 6371000; // Radius of Earth in meters
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a = 
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) * 
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c; // Distance in meters
+}
+
 // --- JWT Verification Middleware ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -288,7 +304,7 @@ app.post('/api/auth/login', async (req, res) => {
 // GET PROFILE ENDPOINT (/api/auth/me)
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
-        // 1. Get logged-in user details and their circle (including profile_avatar)
+        // 1. Get logged-in user details and their circle
         const [userRows] = await db.query(`
             SELECT u.id, u.full_name, u.email, u.profile_avatar, c.id AS circle_id, c.name AS circle_name, c.invite_code
             FROM users u
@@ -305,28 +321,30 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
         const user = userRows[0];
         let circleData = null;
 
-        // 2. Fetch all circle members with dynamic states and profile avatars
+        // 2. Fetch all circle members with user states, location, and updated_at
         if (user.circle_id) {
             const [memberRows] = await db.query(`
-        SELECT 
-            u.id, 
-            u.full_name, 
-            u.email,
-            u.profile_avatar,
-            COALESCE(us.battery_level, 100) AS battery_level,
-            COALESCE(us.speed, NULL) AS speed,
-            us.latitude,
-            us.longitude,
-            CASE 
-                WHEN us.updated_at IS NULL THEN 'Offline'
-                WHEN TIMESTAMPDIFF(MINUTE, us.updated_at, NOW()) > 5 THEN 'Offline'
-                ELSE COALESCE(us.status, 'Active')
-            END AS current_status
-        FROM circle_members cm
-        JOIN users u ON cm.user_id = u.id
-        LEFT JOIN user_states us ON u.id = us.user_id
-        WHERE cm.circle_id = ?
-    `, [user.circle_id]);
+                SELECT 
+                    u.id, 
+                    u.full_name, 
+                    u.email,
+                    u.profile_avatar,
+                    COALESCE(us.battery_level, 100) AS battery_level,
+                    COALESCE(us.speed, '0 km/h') AS speed,
+                    COALESCE(us.location, 'Unknown') AS location,
+                    us.latitude,
+                    us.longitude,
+                    us.updated_at,
+                    CASE 
+                        WHEN us.updated_at IS NULL THEN 'Offline'
+                        WHEN TIMESTAMPDIFF(MINUTE, us.updated_at, NOW()) > 5 THEN 'Offline'
+                        ELSE COALESCE(us.status, 'Active')
+                    END AS current_status
+                FROM circle_members cm
+                JOIN users u ON cm.user_id = u.id
+                LEFT JOIN user_states us ON u.id = us.user_id
+                WHERE cm.circle_id = ?
+            `, [user.circle_id]);
 
             circleData = {
                 id: user.circle_id,
@@ -341,8 +359,11 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
                     status: m.current_status,
                     batteryLevel: m.battery_level,
                     speed: m.speed,
+                    location: m.location,
                     latitude: m.latitude,
-                    longitude: m.longitude
+                    longitude: m.longitude,
+                    updatedAt: m.updated_at ? m.updated_at.toISOString() : null,
+                    updated_at: m.updated_at ? m.updated_at.toISOString() : null
                 }))
             };
         }
@@ -536,23 +557,58 @@ app.post('/api/circle/join', async (req, res) => {
 app.put('/api/user/state', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        // 1. Extract lat and lng from request body alongside existing parameters
         const { batteryLevel, status, speed, latitude, longitude, lat, lng } = req.body;
 
-        // Support both naming conventions (latitude/longitude OR lat/lng)
+        // Support both naming conventions
         const finalLat = latitude !== undefined ? latitude : (lat !== undefined ? lat : null);
         const finalLng = longitude !== undefined ? longitude : (lng !== undefined ? lng : null);
 
-        // 2. Insert or update user state including location coordinates
+        let locationName = "Unknown";
+
+        // 1. Fetch user's circle ID
+        const [circleRows] = await db.query(
+            "SELECT circle_id FROM circle_members WHERE user_id = ? LIMIT 1",
+            [userId]
+        );
+
+        if (circleRows.length > 0 && finalLat !== null && finalLng !== null) {
+            const circleId = circleRows[0].circle_id;
+
+            // 2. Fetch all registered places for this circle
+            const [places] = await db.query(
+                "SELECT name, latitude, longitude, safe_zone_radius_meters FROM places WHERE circle_id = ?",
+                [circleId]
+            );
+
+            // 3. Match user coordinates with places using safe_zone_radius_meters
+            for (const place of places) {
+                const distance = getDistanceInMeters(
+                    parseFloat(finalLat),
+                    parseFloat(finalLng),
+                    parseFloat(place.latitude),
+                    parseFloat(place.longitude)
+                );
+
+                const radius = place.safe_zone_radius_meters || 200; // Default to 200m if radius not set
+
+                if (distance <= radius) {
+                    locationName = place.name;
+                    break;
+                }
+            }
+        }
+
+        // 4. Upsert user state including matched location and timestamp
         const query = `
-            INSERT INTO user_states (user_id, battery_level, status, speed, latitude, longitude, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, NOW())
+            INSERT INTO user_states (user_id, battery_level, status, speed, latitude, longitude, location, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
             ON DUPLICATE KEY UPDATE 
                 battery_level = VALUES(battery_level),
                 status = VALUES(status),
                 speed = VALUES(speed),
                 latitude = VALUES(latitude),
                 longitude = VALUES(longitude),
+                location = VALUES(location),
                 updated_at = NOW()
         `;
 
@@ -560,17 +616,13 @@ app.put('/api/user/state', authenticateToken, async (req, res) => {
             userId,
             batteryLevel || 100,
             status || 'Active',
-            speed || null,
+            speed || '0 km/h',
             finalLat,
-            finalLng
+            finalLng,
+            locationName
         ]);
 
-        // 3. Broadcast real-time location & state update via Socket.IO if user belongs to a circle
-        const [circleRows] = await db.query(
-            "SELECT circle_id FROM circle_members WHERE user_id = ? LIMIT 1",
-            [userId]
-        );
-
+        // 5. Broadcast real-time location & state update via Socket.IO
         if (circleRows.length > 0) {
             const circleId = circleRows[0].circle_id;
             io.to(`circle_${circleId}`).emit('member_location_updated', {
@@ -579,12 +631,17 @@ app.put('/api/user/state', authenticateToken, async (req, res) => {
                 longitude: finalLng,
                 batteryLevel: batteryLevel || 100,
                 status: status || 'Active',
-                speed: speed || null,
-                timestamp: new Date().toISOString()
+                speed: speed || '0 km/h',
+                location: locationName,
+                updatedAt: new Date().toISOString()
             });
         }
 
-        return res.status(200).json({ success: true, message: "State and location updated successfully" });
+        return res.status(200).json({ 
+            success: true, 
+            message: "State and location updated successfully",
+            location: locationName 
+        });
 
     } catch (error) {
         console.error('Update State Error:', error);
