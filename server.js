@@ -50,6 +50,29 @@ async function sendPushNotification(token, title, body, icon = 'ic_notification'
     }
 }
 
+async function triggerCircleAlert(circleId, userId, userName, actionMessage, alertType, category) {
+    try {
+        const [result] = await db.query(
+            `INSERT INTO alerts (circle_id, user_id, user_name, action_message, alert_type, category) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [circleId, userId, userName, actionMessage, alertType, category]
+        );
+
+        // Broadcast to all active circle listeners in real time via Socket.IO
+        io.to(`circle_${circleId}`).emit('new_alert', {
+            id: result.insertId,
+            name: userName,
+            actionText: actionMessage,
+            type: alertType,
+            category: category,
+            timestamp: Date.now()
+        });
+
+    } catch (err) {
+        console.error('Error logging alert:', err.message);
+    }
+}
+
 function generateInviteCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Excluded confusing characters like I, O, 1, 0
     let result = '';
@@ -791,6 +814,99 @@ app.get('/api/places', authenticateToken, async (req, res) => {
     }
 });
 
+/**
+ * GET /api/alerts
+ * Protected Route: Returns shared circle alerts formatted for Android AlertsAdapter
+ */
+app.get('/api/alerts', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        // 1. Get current user's circle
+        const [circleRows] = await db.query(
+            "SELECT circle_id FROM circle_members WHERE user_id = ? LIMIT 1",
+            [userId]
+        );
+
+        if (circleRows.length === 0) {
+            return res.status(200).json({
+                success: true,
+                alerts: []
+            });
+        }
+
+        const circleId = circleRows[0].circle_id;
+
+        // 2. Dynamic check: Generate system low-battery alerts from user_states
+        const [lowBatteryStates] = await db.query(
+            `SELECT us.user_id, u.full_name, us.battery_level 
+             FROM user_states us
+             JOIN circle_members cm ON us.user_id = cm.user_id
+             JOIN users u ON us.user_id = u.id
+             WHERE cm.circle_id = ? AND us.battery_level <= 20`,
+            [circleId]
+        );
+
+        for (const state of lowBatteryStates) {
+            const actionMsg = `Battery critical (${state.battery_level}%)`;
+
+            // Check if alert already logged recently to prevent duplicate spam
+            const [recent] = await db.query(
+                `SELECT id FROM alerts 
+                 WHERE circle_id = ? AND user_id = ? AND alert_type = 'BATTERY' 
+                 AND created_at >= NOW() - INTERVAL 1 HOUR`,
+                [circleId, state.user_id]
+            );
+
+            if (recent.length === 0) {
+                await db.query(
+                    `INSERT INTO alerts (circle_id, user_id, user_name, action_message, alert_type, category) 
+                     VALUES (?, ?, ?, ?, 'BATTERY', 'System')`,
+                    [circleId, state.user_id, state.full_name, actionMsg]
+                );
+            }
+        }
+
+        // 3. Fetch all alerts for the circle sorted by newest first
+        const [alertRows] = await db.query(
+            `SELECT 
+                id,
+                user_name AS name,
+                action_message AS actionText,
+                alert_type AS type,
+                category,
+                UNIX_TIMESTAMP(created_at) * 1000 AS timestamp
+            FROM alerts 
+            WHERE circle_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT 50`,
+            [circleId]
+        );
+
+        // Map data keys to align directly with Android AlertModel.fromJson()
+        const formattedAlerts = alertRows.map(alert => ({
+            id: alert.id,
+            name: alert.name,
+            actionText: alert.actionText,
+            type: alert.type,
+            category: alert.category,
+            timestamp: alert.timestamp
+        }));
+
+        return res.status(200).json({
+            success: true,
+            circleId: circleId,
+            alerts: formattedAlerts
+        });
+
+    } catch (error) {
+        console.error('Fetch Alerts Error:', error);
+        return res.status(500).json({
+            success: false,
+            message: "Server error: " + error.message
+        });
+    }
+});
 
 // --- Server Startup ---
 const PORT = process.env.PORT || 5100;
