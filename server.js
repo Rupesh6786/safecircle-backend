@@ -908,6 +908,89 @@ app.get('/api/alerts', authenticateToken, async (req, res) => {
     }
 });
 
+/**
+ * DELETE /api/auth/delete-account
+ * Protected Route: Verifies credentials and permanently deletes the user account
+ */
+app.delete('/api/auth/delete-account', authenticateToken, async (req, res) => {
+    const { email, password } = req.body;
+    const userId = req.user.id;
+
+    if (!email || !password) {
+        return res.status(400).json({ 
+            success: false, 
+            message: "Email/username and password are required to confirm deletion." 
+        });
+    }
+
+    try {
+        const normalizedEmail = email.toLowerCase().trim();
+
+        // 1. Fetch user credentials from DB
+        const [rows] = await db.query(
+            "SELECT id, email, password FROM users WHERE id = ?",
+            [userId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ success: false, message: "User not found." });
+        }
+
+        const user = rows[0];
+
+        // 2. Verify email matches the authenticated token owner
+        if (user.email !== normalizedEmail) {
+            return res.status(403).json({ 
+                success: false, 
+                message: "Email mismatch. You can only delete your own account." 
+            });
+        }
+
+        // 3. Verify password match
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+        if (!isPasswordValid) {
+            return res.status(401).json({ 
+                success: false, 
+                message: "Invalid password. Account deletion aborted." 
+            });
+        }
+
+        // 4. Fetch user's active circle IDs prior to deletion to handle empty circle cleanup
+        const [circleRows] = await db.query(
+            "SELECT circle_id FROM circle_members WHERE user_id = ?",
+            [userId]
+        );
+
+        // 5. Delete user (Triggers cascading deletion on user_states, circle_members, alerts)
+        await db.query("DELETE FROM users WHERE id = ?", [userId]);
+
+        // 6. Clean up empty orphaned circles
+        for (const row of circleRows) {
+            const circleId = row.circle_id;
+            const [remainingMembers] = await db.query(
+                "SELECT COUNT(*) AS count FROM circle_members WHERE circle_id = ?",
+                [circleId]
+            );
+
+            if (remainingMembers[0].count === 0) {
+                await db.query("DELETE FROM circles WHERE id = ?", [circleId]);
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Account and associated data deleted successfully."
+        });
+
+    } catch (error) {
+        console.error('Delete Account Error:', error);
+        return res.status(500).json({ 
+            success: false, 
+            message: "Server error: " + error.message 
+        });
+    }
+});
+
 // --- Server Startup ---
 const PORT = process.env.PORT || 5100;
 server.listen(PORT, () => {
